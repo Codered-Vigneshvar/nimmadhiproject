@@ -1,704 +1,1399 @@
-from flask import Flask, request, jsonify
+import json
 import boto3
-import re
-from decimal import Decimal
 from botocore.exceptions import ClientError
-from datetime import datetime 
+from boto3.dynamodb.conditions import Attr
+from decimal import Decimal
+from datetime import datetime, timedelta
+import uuid
+import logging
+import hashlib
 
-# Initialize Flask app
-app = Flask(__name__)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Initialize the DynamoDB client
+# Initialize DynamoDB resource
 dynamodb = boto3.resource('dynamodb')
 
-# Helper function to create a table if it doesn't exist
-def create_table_if_not_exists(table_name, key_schema, attribute_definitions, provisioned_throughput):
+# Table names
+users_table_name = 'users'
+stock_table_name = 'stock'
+transactions_table_name = 'stock_transactions'
+production_table_name = 'production'
+push_production_table_name = 'push_to_production'
+
+
+def wait_for_table_creation(table_name):
+    """
+    Helper function that waits for a DynamoDB table to become active.
+    """
     try:
-        table = dynamodb.create_table(
-            TableName=table_name,
-            KeySchema=key_schema,
-            AttributeDefinitions=attribute_definitions,
-            ProvisionedThroughput=provisioned_throughput
-        )
+        table = dynamodb.Table(table_name)
+        logger.info(f"Waiting for table '{table_name}' to be active...")
         table.wait_until_exists()
-        print(f"Table '{table_name}' created successfully.")
+        logger.info(f"Table '{table_name}' is now active.")
+    except Exception as e:
+        logger.error(f"Error while waiting for table '{table_name}': {str(e)}")
+
+
+def initialize_tables():
+    """
+    Checks if required DynamoDB tables exist; if not, creates them.
+    """
+    try:
+        existing_tables = dynamodb.meta.client.list_tables()['TableNames']
+        logger.info(f"Existing tables: {existing_tables}")
+
+        # 1) users
+        if users_table_name not in existing_tables:
+            logger.info(f"Creating '{users_table_name}' table...")
+            dynamodb.create_table(
+                TableName=users_table_name,
+                KeySchema=[
+                    {'AttributeName': 'username', 'KeyType': 'HASH'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'username', 'AttributeType': 'S'}
+                ],
+                ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+            )
+            wait_for_table_creation(users_table_name)
+
+        # 2) stock
+        if stock_table_name not in existing_tables:
+            logger.info(f"Creating '{stock_table_name}' table...")
+            dynamodb.create_table(
+                TableName=stock_table_name,
+                KeySchema=[
+                    {'AttributeName': 'item_id', 'KeyType': 'HASH'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'item_id', 'AttributeType': 'S'}
+                ],
+                ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+            )
+            wait_for_table_creation(stock_table_name)
+
+        # 3) stock_transactions
+        if transactions_table_name not in existing_tables:
+            logger.info(f"Creating '{transactions_table_name}' table...")
+            dynamodb.create_table(
+                TableName=transactions_table_name,
+                KeySchema=[
+                    {'AttributeName': 'transaction_id', 'KeyType': 'HASH'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'transaction_id', 'AttributeType': 'S'}
+                ],
+                ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+            )
+            wait_for_table_creation(transactions_table_name)
+
+        # 4) production
+        if production_table_name not in existing_tables:
+            logger.info(f"Creating '{production_table_name}' table...")
+            dynamodb.create_table(
+                TableName=production_table_name,
+                KeySchema=[
+                    {'AttributeName': 'product_id', 'KeyType': 'HASH'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'product_id', 'AttributeType': 'S'}
+                ],
+                ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+            )
+            wait_for_table_creation(production_table_name)
+
+        # 5) push_to_production
+        if push_production_table_name not in existing_tables:
+            logger.info(f"Creating '{push_production_table_name}' table...")
+            dynamodb.create_table(
+                TableName=push_production_table_name,
+                KeySchema=[
+                    {'AttributeName': 'push_id', 'KeyType': 'HASH'}
+                ],
+                AttributeDefinitions=[
+                    {'AttributeName': 'push_id', 'AttributeType': 'S'}
+                ],
+                ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+            )
+            wait_for_table_creation(push_production_table_name)
+
     except ClientError as e:
-        if e.response['Error']['Code'] == 'ResourceInUseException':
-            print(f"Table '{table_name}' already exists.")
-        else:
-            print(f"Failed to create table '{table_name}': {str(e)}")
-    return dynamodb.Table(table_name)
-
-# Define the tables
-stock_table = create_table_if_not_exists(
-    table_name='stock',
-    key_schema=[{'AttributeName': 'item_id', 'KeyType': 'HASH'}],
-    attribute_definitions=[{'AttributeName': 'item_id', 'AttributeType': 'S'}],
-    provisioned_throughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
-)
-# Create the Production table with a TotalCount attribute
-production_table = create_table_if_not_exists(
-    table_name='production',
-    key_schema=[
-        {'AttributeName': 'ProductName', 'KeyType': 'HASH'}  # Partition key
-    ],
-    attribute_definitions=[
-        {'AttributeName': 'ProductName', 'AttributeType': 'S'}
-    ],
-    provisioned_throughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
-)
-
-products_table = create_table_if_not_exists(
-    table_name='products',
-    key_schema=[{'AttributeName': 'ProductName', 'KeyType': 'HASH'}],
-    attribute_definitions=[{'AttributeName': 'ProductName', 'AttributeType': 'S'}],
-    provisioned_throughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
-)
-materials_table_name = "Table_materials"
-materials_table = create_table_if_not_exists(
-    table_name=materials_table_name,
-    key_schema=[{'AttributeName': 'MaterialName', 'KeyType': 'HASH'}],
-    attribute_definitions=[{'AttributeName': 'MaterialName', 'AttributeType': 'S'}],
-    provisioned_throughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
-)
-@app.route('/api/stock/create', methods=['POST'])
-def create_stock():
-    data = request.json
-
-    # Extract fields
-    name = data.get('Name')
-    qty = data.get('Qty')
-    unit = data.get('Unit')
-    total_cost = data.get('TotalCost')
-    stock_limit = data.get('StockLimit')
-
-    # Validation
-    if not all([name, qty, unit, total_cost, stock_limit]):
-        return jsonify({"error": "All fields (Name, Qty, Unit, TotalCost, StockLimit) are required"}), 400
-
-    try:
-        qty = Decimal(str(qty))
-        total_cost = Decimal(str(total_cost))
-        stock_limit = Decimal(str(stock_limit))
+        logger.error(f"Error creating tables: {e.response['Error']['Message']}")
     except Exception as e:
-        return jsonify({"error": f"Invalid Qty, TotalCost, or StockLimit: {str(e)}"}), 400
+        logger.error(f"Unexpected error in initialize_tables: {str(e)}")
 
-    if qty <= 0 or total_cost < 0 or stock_limit < 0:
-        return jsonify({"error": "Qty must be > 0, TotalCost >= 0, and StockLimit >= 0"}), 400
 
-    if stock_limit > qty:
-        return jsonify({"error": "StockLimit cannot exceed the initial Qty"}), 400
+class DecimalEncoder(json.JSONEncoder):
+    """
+    Helper class to convert a DynamoDB item to JSON, handling Decimal type.
+    """
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return float(o)
+        return super(DecimalEncoder, self).default(o)
 
-    cost_per_unit = total_cost / qty
 
-    # Save to DynamoDB
+def log_transaction(operation_type, details, username):
+    """
+    Generic logger for all operations (except admin operations).
+    Stores them in 'stock_transactions' with Indian Standard Time (IST).
+    """
     try:
-        stock_table.put_item(Item={
-            'item_id': name,
-            'Name': name,
-            'Qty': qty,
-            'Unit': unit,
-            'TotalCost': total_cost,
-            'CostPerUnit': cost_per_unit,
-            'StockLimit': stock_limit
-        })
-        return jsonify({"message": "Stock item created successfully"}), 201
+        transaction_id = str(uuid.uuid4())
+
+        # Convert current UTC time to IST (UTC+5:30)
+        timestamp_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        timestamp_str = timestamp_ist.isoformat()
+        date_str = timestamp_ist.strftime("%Y-%m-%d")
+
+        # Convert any float in 'details' to Decimal
+        for key in list(details.keys()):
+            if isinstance(details[key], float):
+                details[key] = Decimal(str(details[key]))
+
+        details['username'] = username
+
+        transactions_table = dynamodb.Table(transactions_table_name)
+        transactions_table.put_item(
+            Item={
+                'transaction_id': transaction_id,
+                'operation_type': operation_type,
+                'details': details,
+                'date': date_str,
+                'timestamp': timestamp_str
+            }
+        )
+        logger.info(f"Transaction logged: {operation_type}, ID: {transaction_id}")
+
+    except ClientError as e:
+        logger.error(f"Error logging transaction: {e}")
     except Exception as e:
-        return jsonify({"error": f"Failed to save item: {str(e)}"}), 500
+        logger.error(f"Unexpected error in log_transaction: {e}")
 
 
-@app.route('/api/stock/get/<item_id>', methods=['GET'])
-def get_stock(item_id):
+# =============================================================================
+# ================ ADMIN OPERATIONS (No Transaction Logs) =====================
+# =============================================================================
+
+def admin_auth_check(body):
     """
-    Endpoint to retrieve a stock item by its item_id (Name).
-    - Fetches the item from DynamoDB using the provided item_id.
-    - If the item exists, returns it as a JSON response. If not, returns a 404 error.
+    Helper to validate admin username/password. 
+    Returns True if 'username' == 'admin' and 'password' == '37773'; otherwise False.
     """
-    
+    return (body.get('username') == 'admin' and body.get('password') == '37773')
+
+
+def delete_transaction_data(body):
+    """
+    ADMIN-ONLY: Deletes all data from 'stock_transactions'.
+    No transaction log for admin operations.
+    """
     try:
-        # Fetch the item from DynamoDB by item_id (Name)
-        response = stock_table.get_item(Key={'item_id': item_id})
-        item = response.get('Item')
+        if not admin_auth_check(body):
+            return {
+                "statusCode": 403,
+                "body": json.dumps({"error": "Unauthorized: Admin credentials required."})
+            }
 
-        # If item is not found, return a 404 error
-        if not item:
-            return jsonify({"error": "Item not found"}), 404
-        
-        # Return the item as a JSON response
-        return jsonify(item), 200
+        transactions_table = dynamodb.Table(transactions_table_name)
+        # Scan all items, then delete in a loop
+        scan_resp = transactions_table.scan()
+        items = scan_resp.get('Items', [])
+
+        with transactions_table.batch_writer() as batch:
+            for item in items:
+                batch.delete_item(Key={'transaction_id': item['transaction_id']})
+
+        # If you want to keep deleting in pages until 'LastEvaluatedKey' no longer exists, do so:
+        while 'LastEvaluatedKey' in scan_resp:
+            scan_resp = transactions_table.scan(ExclusiveStartKey=scan_resp['LastEvaluatedKey'])
+            items = scan_resp.get('Items', [])
+            with transactions_table.batch_writer() as batch:
+                for item in items:
+                    batch.delete_item(Key={'transaction_id': item['transaction_id']})
+
+        logger.info("All transaction data deleted by admin.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "All transaction data deleted."})
+        }
+
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch item: {str(e)}"}), 500
+        logger.error(f"Error in delete_transaction_data: {str(e)}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
 
 
-@app.route('/api/stock/update/<item_id>', methods=['PUT'])
-def update_stock(item_id):
+def admin_view_users(body):
     """
-    Endpoint to update an existing stock item.
-    - Updates Qty, TotalCost, StockLimit.
-    - Dynamically recalculates CostPerUnit when Qty or TotalCost is updated.
+    ADMIN-ONLY: View all users from 'users' table.
+    No transaction logs for this operation.
     """
-    # Get the JSON data from the request
-    data = request.json
-
-    # Extract fields
-    qty = data.get('Qty')
-    total_cost = data.get('TotalCost')
-    stock_limit = data.get('StockLimit')
-
-    # Retrieve the current data for the stock item from DynamoDB
-    stock_item = stock_table.get_item(Key={'item_id': item_id}).get('Item')
-
-    if not stock_item:
-        return jsonify({"error": "Stock item not found"}), 404
-
-    # Validate inputs
     try:
-        if qty is not None:
-            qty = Decimal(str(qty))
-            if qty <= 0:
-                return jsonify({"error": "Qty must be greater than zero"}), 400
-        if total_cost is not None:
-            total_cost = Decimal(str(total_cost))
-            if total_cost < 0:
-                return jsonify({"error": "TotalCost must be non-negative"}), 400
-        if stock_limit is not None:
-            stock_limit = Decimal(str(stock_limit))
-            if stock_limit < 0:
-                return jsonify({"error": "StockLimit must be non-negative"}), 400
-            # Ensure Qty does not go below the updated StockLimit
-            if qty is not None and qty < stock_limit:
-                return jsonify({"error": f"Qty ({qty}) cannot be less than StockLimit ({stock_limit})"}), 400
-            elif qty is None and stock_item['Qty'] < stock_limit:
-                return jsonify({
-                    "error": f"Existing Qty ({stock_item['Qty']}) cannot be less than the updated StockLimit ({stock_limit})"
-                }), 400
+        if not admin_auth_check(body):
+            return {
+                "statusCode": 403,
+                "body": json.dumps({"error": "Unauthorized: Admin credentials required."})
+            }
+
+        users_table = dynamodb.Table(users_table_name)
+        scan_resp = users_table.scan()
+        items = scan_resp.get('Items', [])
+
+        # Keep scanning if needed
+        while 'LastEvaluatedKey' in scan_resp:
+            scan_resp = users_table.scan(ExclusiveStartKey=scan_resp['LastEvaluatedKey'])
+            items.extend(scan_resp.get('Items', []))
+
+        logger.info("Admin viewed all users.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(items, cls=DecimalEncoder)
+        }
+
     except Exception as e:
-        return jsonify({"error": f"Invalid input: {str(e)}"}), 400
+        logger.error(f"Error in admin_view_users: {str(e)}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
 
-    # Retrieve existing values for calculations
-    current_qty = stock_item.get('Qty', Decimal(1))  # Avoid division by zero
-    current_total_cost = stock_item.get('TotalCost', Decimal(0))
 
-    # Calculate updated CostPerUnit if applicable
-    updated_qty = qty if qty is not None else current_qty
-    updated_total_cost = total_cost if total_cost is not None else current_total_cost
-    updated_cost_per_unit = updated_total_cost / updated_qty
-
-    # Prepare the update expression
-    update_expression = "SET "
-    expression_attribute_values = {}
-
-    if qty is not None:
-        update_expression += "Qty = :qty, "
-        expression_attribute_values[":qty"] = updated_qty
-    if total_cost is not None:
-        update_expression += "TotalCost = :total_cost, "
-        expression_attribute_values[":total_cost"] = updated_total_cost
-    if stock_limit is not None:
-        update_expression += "StockLimit = :stock_limit, "
-        expression_attribute_values[":stock_limit"] = stock_limit
-
-    # Always update CostPerUnit
-    update_expression += "CostPerUnit = :cost_per_unit"
-    expression_attribute_values[":cost_per_unit"] = updated_cost_per_unit
-
+def admin_update_user(body):
+    """
+    ADMIN-ONLY: Update user details in 'users' table (e.g., password).
+    No transaction logs for this operation.
+    Example payload:
+    {
+      "operation": "AdminUpdateUser",
+      "admin_username": "admin",
+      "admin_password": "37773",
+      "username_to_update": "john_doe",
+      "new_password": "someNewPass"
+    }
+    """
     try:
-        # Perform the update in DynamoDB
+        if not admin_auth_check(body):
+            return {
+                "statusCode": 403,
+                "body": json.dumps({"error": "Unauthorized: Admin credentials required."})
+            }
+
+        if 'username_to_update' not in body:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "'username_to_update' is required"})
+            }
+
+        username_to_update = body['username_to_update']
+        new_password = body.get('new_password')
+
+        users_table = dynamodb.Table(users_table_name)
+        user_resp = users_table.get_item(Key={'username': username_to_update})
+        if 'Item' not in user_resp:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"User '{username_to_update}' not found."})
+            }
+
+        # Let's say we only allow password update for simplicity:
+        if new_password:
+            hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
+            users_table.update_item(
+                Key={'username': username_to_update},
+                UpdateExpression="SET #p = :pw",
+                ExpressionAttributeNames={"#p": "password"},
+                ExpressionAttributeValues={":pw": hashed_password}
+            )
+
+        logger.info(f"Admin updated user '{username_to_update}'.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": f"User '{username_to_update}' updated successfully."})
+        }
+
+    except Exception as e:
+        logger.error(f"Error in admin_update_user: {str(e)}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+# =============================================================================
+# ================ USER MANAGEMENT (Register, Login) ===========================
+# =============================================================================
+
+def register_user(body):
+    """
+    Register a new user in 'users'.
+    """
+    try:
+        if 'username' not in body or 'password' not in body:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "'username' and 'password' are required."})
+            }
+
+        username = body['username']
+        password = body['password']
+
+        users_table = dynamodb.Table(users_table_name)
+        existing_user = users_table.get_item(Key={'username': username}).get('Item')
+        if existing_user:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "User already exists."})
+            }
+
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        users_table.put_item(
+            Item={
+                'username': username,
+                'password': hashed_password
+            }
+        )
+        logger.info(f"New user registered: {username}")
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "User registered successfully."})
+        }
+    except Exception as e:
+        logger.error(f"Error registering user: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def login_user(body):
+    """
+    Login by checking hashed password in 'users'.
+    """
+    try:
+        if 'username' not in body or 'password' not in body:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "'username' and 'password' are required."})
+            }
+
+        username = body['username']
+        password = body['password']
+        users_table = dynamodb.Table(users_table_name)
+
+        user_item = users_table.get_item(Key={'username': username}).get('Item')
+        if not user_item:
+            return {
+                "statusCode": 401,
+                "body": json.dumps({"error": "Invalid username or password."})
+            }
+
+        hashed_input_password = hashlib.sha256(password.encode()).hexdigest()
+        if hashed_input_password != user_item['password']:
+            return {
+                "statusCode": 401,
+                "body": json.dumps({"error": "Invalid username or password."})
+            }
+
+        logger.info(f"User logged in: {username}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Login successful."})
+        }
+    except Exception as e:
+        logger.error(f"Error logging in user: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+# =============================================================================
+# ====================== STOCK (Create, Update, etc.) =========================
+# =============================================================================
+
+def create_stock(body):
+    """
+    Create a new stock item in 'stock'.
+    """
+    try:
+        required = ['name', 'quantity', 'defective', 'cost_per_unit', 'stock_limit', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        item_id = body['name']
+        quantity = int(body['quantity'])
+        defective = int(body['defective'])
+        cost_per_unit = Decimal(str(body['cost_per_unit']))
+        stock_limit = int(body['stock_limit'])
+        username = body['username']
+
+        if quantity < 0 or defective < 0 or defective > quantity:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Invalid quantity or defective values"})
+            }
+
+        available_quantity = quantity - defective
+        total_cost = available_quantity * cost_per_unit
+
+        stock_table = dynamodb.Table(stock_table_name)
+        existing_item = stock_table.get_item(Key={'item_id': item_id}).get('Item')
+        if existing_item:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Stock with this name already exists"})
+            }
+
+        # Insert new stock
+        stock_table.put_item(
+            Item={
+                'item_id': item_id,
+                'name': item_id,
+                'quantity': available_quantity,
+                'cost_per_unit': cost_per_unit,
+                'total_cost': total_cost,
+                'stock_limit': stock_limit,
+                'defective': defective,
+                'total_quantity': quantity,
+                'username': username
+            }
+        )
+
+        # Log transaction
+        log_transaction(
+            "CreateStock",
+            {
+                'item_id': item_id,
+                'available_quantity': available_quantity,
+                'defective': defective,
+                'quantity': quantity,
+                'cost_per_unit': float(cost_per_unit),
+                'total_cost': float(total_cost),
+                'stock_limit': stock_limit
+            },
+            username
+        )
+
+        logger.info(f"Stock created by {username}: {item_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Stock created successfully.",
+                "name": item_id,
+                "quantity": available_quantity,
+                "defective": defective,
+                "total_quantity": quantity,
+                "cost_per_unit": float(cost_per_unit),
+                "total_cost": float(total_cost),
+                "stock_limit": stock_limit,
+                "username": username
+            }, cls=DecimalEncoder)
+        }
+    except Exception as e:
+        logger.error(f"Error in create_stock: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def update_stock(body):
+    """
+    Update an existing stock item.
+    """
+    try:
+        required = ['name', 'quantity', 'defective', 'cost_per_unit', 'stock_limit', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        item_id = body['name']
+        new_quantity = int(body['quantity'])
+        defective = int(body['defective'])
+        new_cost_per_unit = Decimal(str(body['cost_per_unit']))
+        stock_limit = int(body['stock_limit'])
+        username = body['username']
+
+        available_quantity = new_quantity - defective
+        new_total_cost = available_quantity * new_cost_per_unit
+
+        stock_table = dynamodb.Table(stock_table_name)
+        existing_item = stock_table.get_item(Key={'item_id': item_id}).get('Item')
+        if not existing_item:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": "Stock item not found"})
+            }
+
+        old_quantity = existing_item['quantity']
+        old_cost_per_unit = existing_item['cost_per_unit']
+
         stock_table.update_item(
             Key={'item_id': item_id},
-            UpdateExpression=update_expression,
-            ExpressionAttributeValues=expression_attribute_values
-        )
-        return jsonify({"message": "Stock item updated successfully"}), 200
-    except Exception as e:
-        return jsonify({"error": f"Failed to update item: {str(e)}"}), 500
-
-@app.route('/api/stock/delete/<item_id>', methods=['DELETE'])
-def delete_stock(item_id):
-    """
-    Endpoint to delete a stock item from the database by its item_id.
-    - Deletes the stock item from DynamoDB using the provided item_id.
-    - Returns a success message upon successful deletion.
-    """
-    
-    try:
-        # Delete the stock item from DynamoDB by item_id
-        stock_table.delete_item(Key={'item_id': item_id})
-        return jsonify({"message": "Stock item deleted successfully"}), 200
-    except Exception as e:
-        return jsonify({"error": f"Failed to delete item: {str(e)}"}), 500
-
-@app.route('/api/products/create', methods=['POST'])
-def create_product():
-    data = request.json
-
-    if not data.get('ProductName') or not data.get('Materials'):
-        return jsonify({"error": "ProductName and Materials are required"}), 400
-
-    product_name = data['ProductName']
-    materials = data['Materials']
-
-    # Sanitize the product name for DynamoDB table name
-    sanitized_product_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', product_name)
-    materials_table_name = f"materials_{sanitized_product_name}"
-
-    for material in materials:
-        if 'MaterialName' not in material or 'QtyRequired' not in material or 'CostPerUnit' not in material:
-            return jsonify({"error": "Each material must have MaterialName, QtyRequired, and CostPerUnit"}), 400
-        if Decimal(str(material['QtyRequired'])) <= 0 or Decimal(str(material['CostPerUnit'])) <= 0:
-            return jsonify({"error": f"Invalid QtyRequired or CostPerUnit for material '{material['MaterialName']}'"}), 400
-
-    # Create the materials table
-    create_table_if_not_exists(
-        table_name=materials_table_name,
-        key_schema=[{'AttributeName': 'MaterialName', 'KeyType': 'HASH'}],
-        attribute_definitions=[{'AttributeName': 'MaterialName', 'AttributeType': 'S'}],
-        provisioned_throughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
-    )
-
-    # Add materials to the table
-    materials_table = dynamodb.Table(materials_table_name)
-    try:
-        with materials_table.batch_writer() as batch:
-            for material in materials:
-                batch.put_item(Item={
-                    'MaterialName': material['MaterialName'],
-                    'QtyRequired': Decimal(str(material['QtyRequired'])),
-                    'CostPerUnit': Decimal(str(material['CostPerUnit']))
-                })
-    except Exception as e:
-        return jsonify({"error": f"Failed to populate materials table: {str(e)}"}), 500
-
-    # Calculate total cost
-    total_cost = sum(
-        Decimal(str(material['QtyRequired'])) * Decimal(str(material['CostPerUnit']))
-        for material in materials
-    )
-
-    # Add product to the products table
-    try:
-        products_table.put_item(Item={
-            'ProductName': product_name,
-            'MaterialsTable': materials_table_name,
-            'Cost': total_cost,
-            'Timestamp': datetime.now().isoformat()
-        })
-
-        return jsonify({
-            "message": f"Product '{product_name}' created successfully.",
-            "Cost": float(total_cost)
-        }), 201
-    except Exception as e:
-        return jsonify({"error": f"Failed to create product: {str(e)}"}), 500
-
-@app.route('/api/products/recalculate', methods=['POST'])
-def recalculate_max_products_and_cost():
-    """
-    Recalculates the maximum number of products that can be created
-    and updates the total production cost dynamically in the products table.
-    """
-    data = request.json
-    if not data or not data.get('ProductName'):
-        return jsonify({"error": "ProductName is required."}), 400
-
-    product_name = data['ProductName']
-    product = products_table.get_item(Key={'ProductName': product_name}).get('Item')
-    if not product:
-        return jsonify({"error": f"Product '{product_name}' not found"}), 404
-
-    materials_table_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"materials_{product_name}")
-    try:
-        # Fetch all materials for the product
-        materials_table = dynamodb.Table(materials_table_name)
-        materials = materials_table.scan().get('Items', [])
-    except Exception as e:
-        return jsonify({"error": f"Error accessing materials table: {str(e)}"}), 500
-
-    if not materials:
-        return jsonify({"error": "No materials found for the product."}), 400
-
-    # Initialize variables for calculations
-    max_products_can_be_created = float('inf')
-    total_cost = Decimal('0.00')
-    insufficient_materials = []
-
-    for material in materials:
-        material_name = material['MaterialName']
-        qty_required = Decimal(str(material['QtyRequired']))
-        cost_per_unit = Decimal(str(material.get('CostPerUnit', 0)))  # Default cost is 0 if missing
-        stock_item = stock_table.get_item(Key={'item_id': material_name}).get('Item')
-
-        # Calculate maximum possible products based on available stock
-        if stock_item:
-            qty_available = Decimal(str(stock_item['Qty']))
-            max_possible = qty_available // qty_required
-            max_products_can_be_created = min(max_products_can_be_created, max_possible)
-        else:
-            insufficient_materials.append({
-                "MaterialName": material_name,
-                "AvailableQty": 0,
-                "RequiredQty": qty_required
-            })
-            max_products_can_be_created = 0
-
-        # Accumulate total cost for production
-        total_cost += qty_required * cost_per_unit
-
-    # Update the products table with recalculated max products and total cost
-    try:
-        products_table.update_item(
-            Key={'ProductName': product_name},
-            UpdateExpression="SET MaxProductsCanBeCreated = :max_products, Cost = :cost",
-            ExpressionAttributeValues={
-                ":max_products": int(max_products_can_be_created),
-                ":cost": total_cost
-            }
-        )
-    except Exception as e:
-        return jsonify({"error": f"Failed to update product: {str(e)}"}), 500
-
-    # Prepare the response
-    response = {
-        "message": f"Max products and cost recalculated for '{product_name}'.",
-        "MaxProductsCanBeCreated": int(max_products_can_be_created),
-        "TotalCost": float(total_cost)
-    }
-    if insufficient_materials:
-        response["InsufficientMaterials"] = insufficient_materials
-
-    return jsonify(response), 200
-
-
-@app.route('/api/stock/all', methods=['GET'])
-def get_all_stock():
-    """
-    Endpoint to retrieve all data from the Stock table.
-    - Fetches all items using a scan operation.
-    - Returns a JSON response with all items or an error message if the operation fails.
-    """
-    try:
-        # Ensure the stock_table is initialized
-        if not stock_table:
-            return jsonify({"error": "Stock table is not initialized correctly."}), 500
-
-        # Perform a scan operation to fetch all items in the stock table
-        response = stock_table.scan()
-        items = response.get('Items', [])
-
-        # Return all items as a JSON response
-        return jsonify({
-            "message": "Stock table data retrieved successfully.",
-            "data": items
-        }), 200
-    except ClientError as e:
-        # Handle AWS DynamoDB client errors
-        return jsonify({"error": f"DynamoDB ClientError: {e.response['Error']['Message']}"}), 500
-    except Exception as e:
-        # Handle any other exceptions
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
-@app.route('/api/production/push', methods=['POST'])
-def push_to_production():
-    """
-    API to push a product for production.
-    - Validates the requested quantity.
-    - Deducts materials from stock and updates the products table.
-    - Records the production in the production table.
-    """
-    try:
-        data = request.get_json()
-        product_name = data.get('ProductName')
-        quantity = data.get('Quantity')
-
-        if not product_name or quantity is None:
-            return jsonify({"error": "ProductName and Quantity are required."}), 400
-
-        # Convert quantity to Decimal
-        try:
-            quantity = Decimal(str(quantity))
-            if quantity <= 0:
-                return jsonify({"error": "Quantity must be greater than zero."}), 400
-        except (ValueError, InvalidOperation):
-            return jsonify({"error": "Invalid quantity. Must be a numeric value."}), 400
-
-        # Fetch product details
-        product_details = products_table.get_item(Key={'ProductName': product_name}).get('Item')
-        if not product_details:
-            return jsonify({"error": f"Product '{product_name}' not found."}), 404
-
-        materials_table_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"materials_{product_name}")
-        try:
-            materials_table = dynamodb.Table(materials_table_name)
-            materials = materials_table.scan().get('Items', [])
-        except Exception as e:
-            return jsonify({"error": f"Error accessing materials table for product '{product_name}': {str(e)}"}), 500
-
-        if not materials:
-            return jsonify({"error": "No materials found for the product."}), 400
-
-        max_products = Decimal(product_details.get('MaxProductsCanBeCreated', 0))
-        total_produced_qty = Decimal(product_details.get('TotalProducedQty', 0))  # Default to 0
-        if quantity > max_products:
-            return jsonify({
-                "error": f"Requested quantity exceeds the maximum products that can be created. Max: {max_products}."
-            }), 400
-
-        insufficient_materials = []
-        total_production_cost = Decimal('0')
-
-        # Check stock and deduct materials
-        for material in materials:
-            material_name = material['MaterialName']
-            qty_required_per_product = Decimal(str(material['QtyRequired']))
-            cost_per_unit = Decimal(str(material['CostPerUnit']))
-
-            total_qty_required = qty_required_per_product * quantity
-            total_cost = total_qty_required * cost_per_unit
-            total_production_cost += total_cost
-
-            stock_item = stock_table.get_item(Key={'item_id': material_name}).get('Item')
-            if not stock_item:
-                insufficient_materials.append({
-                    "MaterialName": material_name,
-                    "AvailableQty": 0,
-                    "RequiredQty": float(total_qty_required)
-                })
-                continue
-
-            available_qty = Decimal(str(stock_item['Qty']))
-            if available_qty < total_qty_required:
-                insufficient_materials.append({
-                    "MaterialName": material_name,
-                    "AvailableQty": float(available_qty),
-                    "RequiredQty": float(total_qty_required)
-                })
-            else:
-                new_qty = available_qty - total_qty_required
-                stock_table.update_item(
-                    Key={'item_id': material_name},
-                    UpdateExpression="SET Qty = :new_qty",
-                    ExpressionAttributeValues={':new_qty': new_qty}
-                )
-
-        if insufficient_materials:
-            return jsonify({
-                "error": "Insufficient materials for production.",
-                "InsufficientMaterials": insufficient_materials
-            }), 400
-
-        # Update product's MaxProductsCanBeCreated and TotalProducedQty
-        new_max_products = max_products - quantity
-        new_total_produced_qty = total_produced_qty + quantity
-        products_table.update_item(
-            Key={'ProductName': product_name},
             UpdateExpression="""
-                SET MaxProductsCanBeCreated = :new_max,
-                    TotalProducedQty = :new_produced,
-                    Cost = :new_cost
+                SET quantity = :quantity,
+                    cost_per_unit = :cost_per_unit,
+                    total_cost = :total_cost,
+                    stock_limit = :stock_limit,
+                    defective = :defective,
+                    total_quantity = :total_quantity
             """,
             ExpressionAttributeValues={
-                ':new_max': new_max_products,
-                ':new_produced': new_total_produced_qty,
-                ':new_cost': total_production_cost
+                ':quantity': available_quantity,
+                ':cost_per_unit': new_cost_per_unit,
+                ':total_cost': new_total_cost,
+                ':stock_limit': stock_limit,
+                ':defective': defective,
+                ':total_quantity': new_quantity
             }
         )
 
-        # Record production
+        # Log update
+        log_transaction(
+            "UpdateStock",
+            {
+                'item_id': item_id,
+                'old_quantity': old_quantity,
+                'new_quantity': available_quantity,
+                'defective': defective,
+                'total_quantity': new_quantity,
+                'old_cost_per_unit': float(old_cost_per_unit),
+                'new_cost_per_unit': float(new_cost_per_unit),
+                'new_total_cost': float(new_total_cost),
+                'stock_limit': stock_limit
+            },
+            username
+        )
+
+        logger.info(f"Stock updated by {username}: {item_id}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Stock updated successfully.",
+                "name": item_id,
+                "quantity": available_quantity,
+                "defective": defective,
+                "total_quantity": new_quantity,
+                "cost_per_unit": float(new_cost_per_unit),
+                "total_cost": float(new_total_cost),
+                "stock_limit": stock_limit,
+                "username": username
+            }, cls=DecimalEncoder)
+        }
+    except Exception as e:
+        logger.error(f"Error in update_stock: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def delete_stock(body):
+    """
+    Delete a stock item.
+    """
+    try:
+        required = ['name', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        name = body['name']
+        username = body['username']
+
+        stock_table = dynamodb.Table(stock_table_name)
+        response = stock_table.get_item(Key={'item_id': name})
+        if 'Item' not in response:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Stock item '{name}' not found."})
+            }
+
+        stock_table.delete_item(Key={'item_id': name})
+
+        # Log transaction
+        log_transaction(
+            "DeleteStock",
+            {
+                "item_id": name,
+                "details": f"Stock '{name}' deleted"
+            },
+            username
+        )
+
+        logger.info(f"Stock '{name}' deleted by {username}.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": f"Stock '{name}' deleted successfully."})
+        }
+
+    except Exception as e:
+        logger.error(f"Error in delete_stock: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def get_all_stocks(body):
+    """
+    Get all stock items.
+    """
+    try:
+        username = body.get('username', 'Unknown')
+        stock_table = dynamodb.Table(stock_table_name)
+
+        items = []
+        response = stock_table.scan()
+        items.extend(response['Items'])
+        while 'LastEvaluatedKey' in response:
+            response = stock_table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            items.extend(response['Items'])
+
+        logger.info(f"User '{username}' retrieved all stock items.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(items, cls=DecimalEncoder)
+        }
+    except Exception as e:
+        logger.error(f"Error in get_all_stocks: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+# =============================================================================
+# ======================= PRODUCTION (Product CRUD) ===========================
+# =============================================================================
+
+def create_product(body):
+    """
+    Create a new product in 'production'.
+    Example:
+      {
+        "operation": "CreateProduct",
+        "product_name": "CoolGadget",
+        "stock_needed": {
+          "ItemA": 2,
+          "ItemB": 1
+        },
+        "username": "john_doe"
+      }
+    Automatically calculates how many units can be produced with current stock.
+    """
+    try:
+        required = ['product_name', 'stock_needed', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        product_name = body['product_name']
+        stock_needed = body['stock_needed']  # dict of {stock_item: qty_per_unit}
+        username = body['username']
+
+        product_id = str(uuid.uuid4())
+        stock_table = dynamodb.Table(stock_table_name)
+
+        # Calculate max_produce
+        max_produce = None
+        for item_id, qty_needed_str in stock_needed.items():
+            qty_needed_each = Decimal(str(qty_needed_str))
+
+            # fetch stock
+            resp = stock_table.get_item(Key={'item_id': item_id})
+            if 'Item' not in resp:
+                # That stock doesn't exist => can't produce
+                max_produce = 0
+                break
+            available_qty = Decimal(str(resp['Item']['quantity']))
+
+            possible = available_qty // qty_needed_each
+            if max_produce is None or possible < max_produce:
+                max_produce = possible
+
+        if max_produce is None:
+            max_produce = 0
+
+        production_table = dynamodb.Table(production_table_name)
         production_table.put_item(
             Item={
-                'ProductName': product_name,
-                'Quantity': quantity,
-                'ProductionCost': total_production_cost,
-                'Timestamp': datetime.now().isoformat()
+                'product_id': product_id,
+                'product_name': product_name,
+                'stock_needed': stock_needed,
+                'max_produce': int(max_produce),
+                'username': username
             }
         )
 
-        return jsonify({
-            "message": f"{float(quantity)} '{product_name}' pushed for production successfully.",
-            "ProductionCost": float(total_production_cost),
-            "RemainingMaxProducts": float(new_max_products)
-        }), 200
+        # Log
+        log_transaction(
+            "CreateProduct",
+            {
+                "product_id": product_id,
+                "product_name": product_name,
+                "stock_needed": stock_needed,
+                "max_produce": int(max_produce)
+            },
+            username
+        )
+
+        logger.info(f"Product created: {product_name} (ID: {product_id}), max produce={max_produce}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Product created successfully.",
+                "product_id": product_id,
+                "product_name": product_name,
+                "stock_needed": stock_needed,
+                "max_produce": int(max_produce)
+            }, cls=DecimalEncoder)
+        }
 
     except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        logger.error(f"Error in create_product: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
 
-@app.route('/api/production/undo', methods=['POST'])
-def undo_production():
+
+def update_product(body):
     """
-    API to undo a production operation.
-    - Restores stock levels for materials.
-    - Updates the MaxProductsCanBeCreated and TotalProducedQty counts in the products table.
-    - Deducts the proportional production cost.
-    - Removes the production record from the production table.
+    Update product fields (name, stock_needed). Recalculate max_produce if stock_needed changed.
     """
     try:
-        data = request.get_json()
-        product_name = data.get('ProductName')
-        quantity = data.get('Quantity')
+        required = ['product_id', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
 
-        if not product_name or quantity is None:
-            return jsonify({"error": "ProductName and Quantity are required."}), 400
+        product_id = body['product_id']
+        username = body['username']
 
-        # Convert quantity to Decimal
-        try:
-            quantity = Decimal(str(quantity))
-            if quantity <= 0:
-                return jsonify({"error": "Quantity must be greater than zero."}), 400
-        except (ValueError, InvalidOperation):
-            return jsonify({"error": "Invalid Quantity. Must be a numeric value."}), 400
+        production_table = dynamodb.Table(production_table_name)
+        product_response = production_table.get_item(Key={'product_id': product_id})
+        if 'Item' not in product_response:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Product '{product_id}' not found."})
+            }
 
-        # Fetch production record
-        production_record = production_table.get_item(
-            Key={'ProductName': product_name}
-        ).get('Item')
+        product_item = product_response['Item']
+        new_product_name = body.get('product_name', product_item.get('product_name'))
+        new_stock_needed = body.get('stock_needed', product_item.get('stock_needed'))
 
-        if not production_record:
-            return jsonify({"error": f"No production record found for '{product_name}'."}), 404
+        # If stock_needed changed, recalc max_produce
+        if 'stock_needed' in body:
+            stock_table = dynamodb.Table(stock_table_name)
+            max_produce = None
 
-        # Get production quantity and cost
-        produced_quantity = Decimal(str(production_record.get('Quantity', 0)))
-        production_cost = Decimal(str(production_record.get('ProductionCost', 0)))
+            for item_id, qty_needed_str in new_stock_needed.items():
+                qty_needed = Decimal(str(qty_needed_str))
+                resp = stock_table.get_item(Key={'item_id': item_id})
+                if 'Item' not in resp:
+                    max_produce = 0
+                    break
+                available_qty = Decimal(str(resp['Item']['quantity']))
+                possible = available_qty // qty_needed
+                if max_produce is None or possible < max_produce:
+                    max_produce = possible
 
-        if produced_quantity == 0 or quantity > produced_quantity:
-            return jsonify({
-                "error": f"Cannot undo production. Only {produced_quantity} products have been produced."
-            }), 400
+            if max_produce is None:
+                max_produce = 0
+        else:
+            max_produce = product_item.get('max_produce', 0)
 
-        # Calculate cost reduction
-        cost_per_unit = production_cost / produced_quantity
-        cost_to_reduce = cost_per_unit * quantity
-
-        # Fetch product details
-        product_details = products_table.get_item(Key={'ProductName': product_name}).get('Item')
-        if not product_details:
-            return jsonify({"error": f"Product '{product_name}' not found."}), 404
-
-        # Sanitize table name
-        materials_table_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', f"materials_{product_name}")
-        try:
-            materials_table = dynamodb.Table(materials_table_name)
-            materials = materials_table.scan().get('Items', [])
-        except Exception as e:
-            return jsonify({"error": f"Error accessing materials: {str(e)}"}), 500
-
-        if not materials:
-            return jsonify({"error": "No materials found for the product."}), 400
-
-        # Restore stock
-        for material in materials:
-            material_name = material['MaterialName']
-            qty_required_per_product = Decimal(str(material['QtyRequired']))
-
-            total_qty_to_restore = qty_required_per_product * quantity
-
-            # Fetch stock item
-            stock_item = stock_table.get_item(Key={'item_id': material_name}).get('Item')
-            if not stock_item:
-                return jsonify({
-                    "error": f"Stock item '{material_name}' not found during restoration."
-                }), 400
-
-            new_qty = Decimal(str(stock_item['Qty'])) + total_qty_to_restore
-            stock_table.update_item(
-                Key={'item_id': material_name},
-                UpdateExpression="SET Qty = :new_qty",
-                ExpressionAttributeValues={':new_qty': new_qty}
-            )
-
-        # Update product details
-        current_max_products = Decimal(str(product_details.get('MaxProductsCanBeCreated', 0)))
-        current_produced_qty = Decimal(str(product_details.get('TotalProducedQty', 0)))
-        current_cost = Decimal(str(product_details.get('Cost', 0)))
-
-        updated_max_products = current_max_products + quantity
-        updated_total_produced_qty = current_produced_qty - quantity
-        updated_cost = current_cost - cost_to_reduce
-
-        products_table.update_item(
-            Key={'ProductName': product_name},
+        production_table.update_item(
+            Key={'product_id': product_id},
             UpdateExpression="""
-                SET MaxProductsCanBeCreated = :updated_max,
-                    TotalProducedQty = :updated_qty,
-                    Cost = :updated_cost
+                SET product_name = :pn,
+                    stock_needed = :sn,
+                    max_produce = :mp
             """,
             ExpressionAttributeValues={
-                ':updated_max': updated_max_products,
-                ':updated_qty': updated_total_produced_qty,
-                ':updated_cost': updated_cost
+                ':pn': new_product_name,
+                ':sn': new_stock_needed,
+                ':mp': int(max_produce)
             }
         )
 
-        # Update production record or delete it if quantity is fully undone
-        remaining_quantity = produced_quantity - quantity
-        if remaining_quantity > 0:
-            new_production_cost = cost_per_unit * remaining_quantity
-            production_table.update_item(
-                Key={'ProductName': product_name},
-                UpdateExpression="SET Quantity = :remaining_qty, ProductionCost = :new_cost",
-                ExpressionAttributeValues={
-                    ':remaining_qty': remaining_quantity,
-                    ':new_cost': new_production_cost
-                }
-            )
-        else:
-            production_table.delete_item(Key={'ProductName': product_name})
+        # Log
+        log_transaction(
+            "UpdateProduct",
+            {
+                "product_id": product_id,
+                "new_product_name": new_product_name,
+                "new_stock_needed": new_stock_needed,
+                "max_produce": int(max_produce)
+            },
+            username
+        )
 
-        return jsonify({
-            "message": f"Successfully undid the production of {quantity} '{product_name}'.",
-            "RestoredMaterials": materials,
-            "UpdatedMaxProducts": float(updated_max_products),
-            "UpdatedTotalProducedQty": float(updated_total_produced_qty),
-            "DeductedCost": float(cost_to_reduce),
-            "RemainingQuantity": float(remaining_quantity)
-        }), 200
+        logger.info(f"Product updated: {product_id}, new max_produce={max_produce}")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Product updated successfully.",
+                "product_id": product_id,
+                "product_name": new_product_name,
+                "stock_needed": new_stock_needed,
+                "max_produce": int(max_produce)
+            }, cls=DecimalEncoder)
+        }
 
     except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
-@app.route('/api/stock/check', methods=['GET'])
-def check_low_stock_levels():
+        logger.error(f"Error in update_product: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def delete_product(body):
     """
-    API to check for low stock levels.
-    - Identifies items in the stock table with quantities below their StockLimit.
-    - Returns details about the items with low stock.
+    Delete a product from 'production'.
     """
     try:
-        # Fetch all stock items from the stock table
-        stock_items = stock_table.scan().get('Items', [])
-        
-        if not stock_items:
-            return jsonify({"message": "No stock items found."}), 404
+        required = ['product_id', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
 
-        low_stock_items = []
+        product_id = body['product_id']
+        username = body['username']
 
-        # Iterate through stock items to check levels
-        for item in stock_items:
-            item_name = item['item_id']
-            current_qty = Decimal(str(item.get('Qty', 0)))
-            stock_limit = Decimal(str(item.get('StockLimit', 0)))  # Assuming 'StockLimit' is defined
+        production_table = dynamodb.Table(production_table_name)
+        product_resp = production_table.get_item(Key={'product_id': product_id})
+        if 'Item' not in product_resp:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Product '{product_id}' not found."})
+            }
 
-            # Identify low stock items
-            if current_qty < stock_limit:
-                low_stock_items.append({
-                    "ItemName": item_name,
-                    "CurrentQuantity": float(current_qty),
-                    "StockLimit": float(stock_limit),
-                    "Deficit": float(stock_limit - current_qty)  # Calculate how much is needed to reach the limit
-                })
+        production_table.delete_item(Key={'product_id': product_id})
 
-        if not low_stock_items:
-            return jsonify({"message": "All stock levels are sufficient."}), 200
+        # Log
+        log_transaction(
+            "DeleteProduct",
+            {
+                "product_id": product_id,
+                "details": f"Product '{product_id}' deleted"
+            },
+            username
+        )
 
-        return jsonify({
-            "message": "Low stock levels detected.",
-            "LowStockItems": low_stock_items
-        }), 200
+        logger.info(f"Product '{product_id}' deleted by {username}.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": f"Product '{product_id}' deleted successfully."
+            })
+        }
+    except Exception as e:
+        logger.error(f"Error in delete_product: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def get_all_products(body):
+    """
+    Retrieve all products from the 'production' table.
+    """
+    try:
+        username = body.get('username', 'Unknown')
+        production_table = dynamodb.Table(production_table_name)
+
+        items = []
+        response = production_table.scan()
+        items.extend(response['Items'])
+        while 'LastEvaluatedKey' in response:
+            response = production_table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            items.extend(response['Items'])
+
+        logger.info(f"User '{username}' retrieved all products.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(items, cls=DecimalEncoder)
+        }
+    except Exception as e:
+        logger.error(f"Error in get_all_products: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+# =============================================================================
+# =========== PUSH TO PRODUCTION & UNDO (push_to_production) ==================
+# =============================================================================
+
+def recalc_max_produce(product_id):
+    """
+    Recalculate the max_produce in 'production' table based on current stock.
+    This is called after stock changes (like after push_to_production).
+    """
+    production_table = dynamodb.Table(production_table_name)
+    stock_table = dynamodb.Table(stock_table_name)
+
+    product_resp = production_table.get_item(Key={'product_id': product_id})
+    if 'Item' not in product_resp:
+        return  # can't recalc if product doesn't exist
+
+    prod_item = product_resp['Item']
+    stock_needed = prod_item['stock_needed']
+    max_produce = None
+
+    for item_id, qty_str in stock_needed.items():
+        qty_needed = Decimal(str(qty_str))
+        stock_resp = stock_table.get_item(Key={'item_id': item_id})
+        if 'Item' not in stock_resp:
+            # no stock => can't produce any
+            max_produce = 0
+            break
+        available_qty = Decimal(str(stock_resp['Item']['quantity']))
+        possible = available_qty // qty_needed
+        if max_produce is None or possible < max_produce:
+            max_produce = possible
+
+    if max_produce is None:
+        max_produce = 0
+
+    # update the product record
+    production_table.update_item(
+        Key={'product_id': product_id},
+        UpdateExpression="SET max_produce = :mp",
+        ExpressionAttributeValues={':mp': int(max_produce)}
+    )
+
+
+def push_to_production(body):
+    """
+    Produce a certain quantity of a product, deducting stock usage, logging in 'push_to_production'.
+    Then recalc max_produce in 'production'.
+    """
+    try:
+        required = ['product_id', 'quantity', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        product_id = body['product_id']
+        quantity_to_produce = int(body['quantity'])
+        username = body['username']
+
+        # 1. Get product details
+        production_table = dynamodb.Table(production_table_name)
+        product_resp = production_table.get_item(Key={'product_id': product_id})
+        if 'Item' not in product_resp:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Product '{product_id}' not found."})
+            }
+
+        product_item = product_resp['Item']
+        product_name = product_item['product_name']
+        stock_needed = product_item['stock_needed']  # dict {stock_item_id: qty_needed_per_unit}
+
+        # 2. Check stock availability
+        stock_table = dynamodb.Table(stock_table_name)
+        required_deductions = {}
+
+        for item_id, qty_str in stock_needed.items():
+            qty_needed_each = Decimal(str(qty_str))
+            total_needed = qty_needed_each * quantity_to_produce
+
+            resp = stock_table.get_item(Key={'item_id': item_id})
+            if 'Item' not in resp:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"Required stock '{item_id}' not found."})
+                }
+
+            available_qty = Decimal(str(resp['Item']['quantity']))
+            if available_qty < total_needed:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"Insufficient stock '{item_id}' to produce {quantity_to_produce}."})
+                }
+
+            required_deductions[item_id] = total_needed
+
+        # 3. Deduct from stock
+        for item_id, deduction_qty in required_deductions.items():
+            stock_item = stock_table.get_item(Key={'item_id': item_id})['Item']
+            new_quantity = Decimal(str(stock_item['quantity'])) - deduction_qty
+            stock_table.update_item(
+                Key={'item_id': item_id},
+                UpdateExpression="SET quantity = :q",
+                ExpressionAttributeValues={':q': new_quantity}
+            )
+
+        # 4. Record push in push_to_production
+        push_table = dynamodb.Table(push_production_table_name)
+        push_id = str(uuid.uuid4())
+
+        # We'll store the deductions as Decimal in DynamoDB to avoid float issues
+        push_table.put_item(
+            Item={
+                'push_id': push_id,
+                'product_id': product_id,
+                'product_name': product_name,
+                'quantity_produced': quantity_to_produce,
+                'stock_deductions': required_deductions,  # Decimals
+                'status': 'ACTIVE',
+                'username': username
+            }
+        )
+
+        # 5. Log transaction
+        log_transaction(
+            "PushToProduction",
+            {
+                "push_id": push_id,
+                "product_id": product_id,
+                "quantity_produced": quantity_to_produce,
+                "deductions": required_deductions
+            },
+            username
+        )
+
+        # 6. Recalculate the max_produce now that stock has changed
+        recalc_max_produce(product_id)
+
+        logger.info(f"Pushed {quantity_to_produce} of '{product_name}' to production (push_id={push_id}).")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Product pushed to production successfully.",
+                "push_id": push_id,
+                "product_id": product_id,
+                "quantity_produced": quantity_to_produce
+            })
+        }
+    except Exception as e:
+        logger.error(f"Error in push_to_production: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def undo_production(body):
+    """
+    Undo a previous push, restoring the deducted stock, marking status=UNDONE.
+    Then recalc max_produce in 'production'.
+    """
+    try:
+        required = ['push_id', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        push_id = body['push_id']
+        username = body['username']
+
+        push_table = dynamodb.Table(push_production_table_name)
+        push_resp = push_table.get_item(Key={'push_id': push_id})
+        if 'Item' not in push_resp:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Push '{push_id}' not found."})
+            }
+
+        push_item = push_resp['Item']
+        if push_item['status'] != 'ACTIVE':
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": f"Push '{push_id}' is not active or already undone."})
+            }
+
+        product_id = push_item['product_id']
+
+        # restore stock
+        stock_deductions = push_item['stock_deductions']  # {item_id: Decimal deducted}
+        stock_table = dynamodb.Table(stock_table_name)
+
+        for item_id, deduction_decimal in stock_deductions.items():
+            stock_resp = stock_table.get_item(Key={'item_id': item_id})
+            if 'Item' in stock_resp:
+                current_qty = Decimal(str(stock_resp['Item']['quantity']))
+                new_qty = current_qty + Decimal(str(deduction_decimal))
+                stock_table.update_item(
+                    Key={'item_id': item_id},
+                    UpdateExpression="SET quantity = :q",
+                    ExpressionAttributeValues={':q': new_qty}
+                )
+            else:
+                # If stock was deleted entirely, skip or re-create if needed.
+                pass
+
+        # mark push as undone
+        push_table.update_item(
+            Key={'push_id': push_id},
+            UpdateExpression="SET #s = :st",
+            ExpressionAttributeNames={'#s': 'status'},
+            ExpressionAttributeValues={':st': 'UNDONE'}
+        )
+
+        # log transaction
+        log_transaction(
+            "UndoProduction",
+            {
+                "push_id": push_id,
+                "details": f"Stock restored for push '{push_id}'"
+            },
+            username
+        )
+
+        # recalc
+        recalc_max_produce(product_id)
+
+        logger.info(f"Undo push '{push_id}' by {username}, stock restored.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": f"Push '{push_id}' undone successfully."})
+        }
+    except Exception as e:
+        logger.error(f"Error in undo_production: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def delete_push_to_production(body):
+    """
+    Delete a push record from 'push_to_production' by push_id.
+    This is a production-related operation => we log it.
+    """
+    try:
+        required = ['push_id', 'username']
+        for field in required:
+            if field not in body:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": f"'{field}' is required"})
+                }
+
+        push_id = body['push_id']
+        username = body['username']
+
+        push_table = dynamodb.Table(push_production_table_name)
+        push_resp = push_table.get_item(Key={'push_id': push_id})
+        if 'Item' not in push_resp:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Push record '{push_id}' not found."})
+            }
+
+        push_table.delete_item(Key={'push_id': push_id})
+
+        # Log
+        log_transaction(
+            "DeletePushToProduction",
+            {
+                "push_id": push_id,
+                "details": f"Push record '{push_id}' deleted"
+            },
+            username
+        )
+
+        logger.info(f"Push record '{push_id}' deleted by {username}.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": f"Push record '{push_id}' deleted successfully."})
+        }
 
     except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        logger.error(f"Error in delete_push_to_production: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
 
 
-# Start the Flask application
-if __name__ == '__main__':
-    app.run(debug=True)
+# =============================================================================
+# =========================== DAILY REPORT ====================================
+# =============================================================================
+
+def get_daily_report(body):
+    """
+    Get a daily report of all operations performed on a given date (IST).
+    """
+    try:
+        if 'date' not in body:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "'date' is required for GetDailyReport operation"})
+            }
+
+        date = body['date']
+        username = body.get('username', 'Unknown')
+
+        transactions_table = dynamodb.Table(transactions_table_name)
+        response = transactions_table.scan(
+            FilterExpression=Attr('date').eq(date)
+        )
+        transactions = response['Items']
+
+        # Categorize by operation_type
+        categorized_report = {}
+        for tx in transactions:
+            operation = tx.get('operation_type', 'UnknownOperation')
+            details = tx.get('details', {})
+            if operation not in categorized_report:
+                categorized_report[operation] = []
+            categorized_report[operation].append(details)
+
+        logger.info(f"Daily report requested by {username} for date {date}.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(categorized_report, cls=DecimalEncoder)
+        }
+    except Exception as e:
+        logger.error(f"Error in get_daily_report: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+# =============================================================================
+# =========================== LAMBDA HANDLER ==================================
+# =============================================================================
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda entry point.
+    1) Ensure tables exist (initialize_tables).
+    2) Parse JSON from event['body'].
+    3) Route to the correct function by 'operation'.
+    """
+    try:
+        # Create tables if they don't exist
+        initialize_tables()
+
+        # Parse the body from the event
+        body = json.loads(event.get('body', '{}'))
+        operation = body.get('operation')
+
+        if not operation:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing 'operation' field"})
+            }
+
+        # -----------------------------
+        # Admin operations (no logs)
+        # -----------------------------
+        if operation == "DeleteTransactionData":
+            return delete_transaction_data(body)
+        elif operation == "AdminViewUsers":
+            return admin_view_users(body)
+        elif operation == "AdminUpdateUser":
+            return admin_update_user(body)
+
+        # -----------------------------
+        # User management
+        # -----------------------------
+        elif operation == "RegisterUser":
+            return register_user(body)
+        elif operation == "LoginUser":
+            return login_user(body)
+
+        # -----------------------------
+        # Stock
+        # -----------------------------
+        elif operation == "CreateStock":
+            return create_stock(body)
+        elif operation == "UpdateStock":
+            return update_stock(body)
+        elif operation == "DeleteStock":
+            return delete_stock(body)
+        elif operation == "GetAllStocks":
+            return get_all_stocks(body)
+
+        # -----------------------------
+        # Production
+        # -----------------------------
+        elif operation == "CreateProduct":
+            return create_product(body)
+        elif operation == "UpdateProduct":
+            return update_product(body)
+        elif operation == "DeleteProduct":
+            return delete_product(body)
+        elif operation == "GetAllProducts":
+            return get_all_products(body)
+
+        # -----------------------------
+        # Push/Undo production
+        # -----------------------------
+        elif operation == "PushToProduction":
+            return push_to_production(body)
+        elif operation == "UndoProduction":
+            return undo_production(body)
+        elif operation == "DeletePushToProduction":
+            return delete_push_to_production(body)
+
+        # -----------------------------
+        # Reporting
+        # -----------------------------
+        elif operation == "GetDailyReport":
+            return get_daily_report(body)
+
+        else:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Invalid operation"})
+            }
+
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON format in request.")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": "Invalid JSON format"})
+        }
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
 
 
 
