@@ -1290,6 +1290,155 @@ def get_daily_report(body):
             "body": json.dumps({"error": f"Internal error: {str(e)}"})
         }
 
+def get_monthly_report(body):
+    """
+    Get a monthly report of all operations performed in a given YYYY-MM (IST),
+    grouped by 'date' and then by 'operation_type'.
+
+    Example result structure:
+    {
+      "2025-02-01": {
+        "CreateStock": [ ... ],
+        "UpdateStock": [ ... ]
+      },
+      "2025-02-02": {
+        "PushToProduction": [ ... ],
+        ...
+      }
+    }
+    """
+    try:
+        if 'month' not in body:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "'month' is required for GetMonthlyReport (format: YYYY-MM)"})
+            }
+
+        month_str = body['month']  # e.g. "2025-02"
+        username = body.get('username', 'Unknown')
+
+        transactions_table = dynamodb.Table(transactions_table_name)
+
+        # We store dates as YYYY-MM-DD in the 'date' field. 
+        # To filter by month, we do 'begins_with(date, month_str)'.
+        response = transactions_table.scan(
+            FilterExpression=Attr('date').begins_with(month_str)
+        )
+        transactions = response['Items']
+
+        # Continue scanning if there's a LastEvaluatedKey
+        while 'LastEvaluatedKey' in response:
+            response = transactions_table.scan(
+                FilterExpression=Attr('date').begins_with(month_str),
+                ExclusiveStartKey=response['LastEvaluatedKey']
+            )
+            transactions.extend(response['Items'])
+
+        # Build a nested structure:
+        # {
+        #   "YYYY-MM-DD": {
+        #       "CreateStock": [...],
+        #       "UpdateStock": [...]
+        #   },
+        #   "YYYY-MM-DD": { ... }
+        # }
+        date_wise_report = {}
+        for tx in transactions:
+            operation = tx.get('operation_type', 'UnknownOperation')
+            details = tx.get('details', {})
+            date_str = tx.get('date', 'UnknownDate')
+
+            # Create the date-level entry if missing
+            if date_str not in date_wise_report:
+                date_wise_report[date_str] = {}
+            # Create the operation-level entry if missing
+            if operation not in date_wise_report[date_str]:
+                date_wise_report[date_str][operation] = []
+
+            date_wise_report[date_str][operation].append(details)
+
+        logger.info(f"Monthly report requested by {username} for month: {month_str}.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(date_wise_report, cls=DecimalEncoder)
+        }
+
+    except Exception as e:
+        logger.error(f"Error in get_monthly_report: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
+
+def get_weekly_report(body):
+    """
+    Get a weekly report of all operations for the past 7 days (IST), grouped by date.
+    Returns a nested JSON structure like:
+    {
+      "YYYY-MM-DD": {
+        "CreateStock": [...],
+        "UpdateStock": [...]
+      },
+      "YYYY-MM-DD": {
+        ...
+      }
+    }
+    """
+    try:
+        username = body.get('username', 'Unknown')
+
+        # Determine 'today' in IST
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        today_str = now_ist.strftime("%Y-%m-%d")
+
+        # Calculate the date 7 days ago
+        seven_days_ago = now_ist - timedelta(days=7)
+        seven_days_ago_str = seven_days_ago.strftime("%Y-%m-%d")
+
+        transactions_table = dynamodb.Table(transactions_table_name)
+        
+        # Filter: date between (seven_days_ago_str) and (today_str)
+        response = transactions_table.scan(
+            FilterExpression=Attr('date').between(seven_days_ago_str, today_str)
+        )
+        transactions = response['Items']
+
+        # Continue scanning if there's a LastEvaluatedKey
+        while 'LastEvaluatedKey' in response:
+            response = transactions_table.scan(
+                FilterExpression=Attr('date').between(seven_days_ago_str, today_str),
+                ExclusiveStartKey=response['LastEvaluatedKey']
+            )
+            transactions.extend(response['Items'])
+
+        # Build a nested structure grouped by date -> operation_type
+        date_wise_report = {}
+        for tx in transactions:
+            operation = tx.get('operation_type', 'UnknownOperation')
+            details = tx.get('details', {})
+            date_str = tx.get('date', 'UnknownDate')
+
+            if date_str not in date_wise_report:
+                date_wise_report[date_str] = {}
+            if operation not in date_wise_report[date_str]:
+                date_wise_report[date_str][operation] = []
+                
+            date_wise_report[date_str][operation].append(details)
+
+        logger.info(f"Weekly report (past 7 days) requested by {username}.")
+        return {
+            "statusCode": 200,
+            "body": json.dumps(date_wise_report, cls=DecimalEncoder)
+        }
+
+    except Exception as e:
+        logger.error(f"Error in get_weekly_report: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        }
+
 
 # =============================================================================
 # =========================== LAMBDA HANDLER ==================================
@@ -1369,11 +1518,20 @@ def lambda_handler(event, context):
             return delete_push_to_production(body)
 
         # -----------------------------
-        # Reporting
+        # Reports
         # -----------------------------
         elif operation == "GetDailyReport":
             return get_daily_report(body)
 
+        # -----------------------------
+        # Reports
+        # -----------------------------
+        elif operation == "GetDailyReport":
+            return get_daily_report(body)
+        elif operation == "GetMonthlyReport":   
+            return get_monthly_report(body)
+        elif operation == "GetWeeklyReport":    
+            return get_weekly_report(body)
         else:
             return {
                 "statusCode": 400,
@@ -1392,8 +1550,4 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps({"error": f"Internal error: {str(e)}"})
         }
-
-
-
-
 
