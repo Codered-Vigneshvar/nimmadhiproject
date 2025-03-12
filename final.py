@@ -6,11 +6,13 @@ from datetime import datetime, timedelta, date
 import uuid
 import logging
 import hashlib
+import calendar
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-dynamodb = boto3.resource('dynamodb')
+# Specify region explicitly (Ohio is us-east-2)
+dynamodb = boto3.resource('dynamodb', region_name='us-east-2')
 
 # Table names
 users_table_name = 'users'
@@ -29,7 +31,8 @@ def wait_for_table_creation(table_name):
         table = dynamodb.Table(table_name)
         logger.info(f"Waiting for table '{table_name}' to be active...")
         table.wait_until_exists()
-        logger.info(f"Table '{table_name}' is now active.")
+        desc = table.table_status
+        logger.info(f"Table '{table_name}' is now active. Status: {desc}")
     except Exception as e:
         logger.error(f"Error while waiting for table '{table_name}': {str(e)}")
 
@@ -381,19 +384,36 @@ def register_user(body):
 
 def login_user(body):
     try:
+        # Check if required fields exist
         if 'username' not in body or 'password' not in body:
             return {"statusCode": 400, "body": json.dumps({"error": "'username' and 'password' are required."})}
+        
         username = body['username']
         password = body['password']
+        
+        # Check for admin credentials
+        if username == "admin":
+            # Ensure password is compared as a string if needed
+            if str(password) == "37773":
+                logger.info("Admin logged in: admin")
+                return {"statusCode": 200, "body": json.dumps({"message": "Admin logged in successfully."})}
+            else:
+                return {"statusCode": 401, "body": json.dumps({"error": "Wrong admin credentials."})}
+        
+        # Non-admin: look up user in the database
         users_table = dynamodb.Table(users_table_name)
         user_item = users_table.get_item(Key={'username': username}).get('Item')
         if not user_item:
             return {"statusCode": 401, "body": json.dumps({"error": "Invalid username or password."})}
+        
+        # Validate password using SHA-256 hash
         hashed_input_password = hashlib.sha256(password.encode()).hexdigest()
         if hashed_input_password != user_item['password']:
             return {"statusCode": 401, "body": json.dumps({"error": "Invalid username or password."})}
+        
         logger.info(f"User logged in: {username}")
         return {"statusCode": 200, "body": json.dumps({"message": "Login successful."})}
+    
     except Exception as e:
         logger.error(f"Error logging in user: {e}")
         return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
@@ -649,13 +669,13 @@ def add_stock_quantity(body):
                 SET total_quantity = :t,
                     quantity = :q,
                     total_cost = :tc,
-                    updated_at = :updated
+                    updated_at = :updated_at
             """,
             ExpressionAttributeValues={
                 ':t': new_total,
                 ':q': new_available,
                 ':tc': new_total_cost,
-                ':updated': now_str
+                ':updated_at': now_str
             }
         )
         log_transaction("AddStockQuantity", {
@@ -704,13 +724,13 @@ def subtract_stock_quantity(body):
                 SET total_quantity = :t,
                     quantity = :q,
                     total_cost = :tc,
-                    updated_at = :updated
+                    updated_at = :updated_at
             """,
             ExpressionAttributeValues={
                 ':t': new_total,
                 ':q': new_available,
                 ':tc': new_total_cost,
-                ':updated': now_str
+                ':updated_at': now_str
             }
         )
         log_transaction("SubtractStockQuantity", {
@@ -752,12 +772,12 @@ def add_defective_goods(body):
             UpdateExpression="""
                 SET defective = :d,
                     quantity = :q,
-                    updated_at = :updated
+                    updated_at = :updated_at
             """,
             ExpressionAttributeValues={
                 ':d': new_defective,
                 ':q': new_available,
-                ':updated': now_str
+                ':updated_at': now_str
             }
         )
         log_transaction("AddDefectiveGoods", {
@@ -799,12 +819,12 @@ def subtract_defective_goods(body):
             UpdateExpression="""
                 SET defective = :d,
                     quantity = :q,
-                    updated_at = :updated
+                    updated_at = :updated_at
             """,
             ExpressionAttributeValues={
                 ':d': new_defective,
                 ':q': new_available,
-                ':updated': now_str
+                ':updated_at': now_str
             }
         )
         log_transaction("SubtractDefectiveGoods", {
@@ -1165,6 +1185,21 @@ def undo_production(body):
     except Exception as e:
         logger.error(f"Error in undo_production: {e}")
         return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
+def get_all_push_to_production(body):
+    try:
+        username = body.get('username', 'Unknown')
+        push_table = dynamodb.Table(push_production_table_name)
+        items = []
+        response = push_table.scan()
+        items.extend(response.get('Items', []))
+        while 'LastEvaluatedKey' in response:
+            response = push_table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            items.extend(response.get('Items', []))
+        logger.info(f"User '{username}' retrieved all push-to-production records.")
+        return {"statusCode": 200, "body": json.dumps(items, cls=DecimalEncoder)}
+    except Exception as e:
+        logger.error(f"Error in get_all_push_to_production: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
 
 def delete_push_to_production(body):
     try:
@@ -1277,148 +1312,63 @@ def format_ist_timestamp(iso_timestamp):
         logger.error(f"Error formatting timestamp {iso_timestamp}: {str(e)}")
         return iso_timestamp
 
-def calculate_stock_at_timestamp(target_timestamp, period_start, period_end):
-    """
-    1. Scans the stock_transactions table for all transactions with timestamp <= target_timestamp.
-    2. If no transactions exist, then it checks for the earliest CreateStock transaction
-       within the period (period_start to period_end) and uses its available quantity (quantity - defective)
-       and total_cost as the opening stock.
-    3. If neither exists, returns 0.
-    4. Otherwise, it processes transactions chronologically to simulate the stock state.
-    """
+def get_daily_report(body):
     try:
-        transactions_table = dynamodb.Table(transactions_table_name)
-        logger.info(f"Scanning transactions with timestamp <= {target_timestamp}")
-        tx_resp = transactions_table.scan(
-            FilterExpression=Attr('timestamp').lte(target_timestamp)
-        )
-        transactions = tx_resp.get('Items', [])
-        while 'LastEvaluatedKey' in tx_resp:
-            tx_resp = transactions_table.scan(
-                FilterExpression=Attr('timestamp').lte(target_timestamp),
-                ExclusiveStartKey=tx_resp['LastEvaluatedKey']
-            )
-            transactions.extend(tx_resp.get('Items', []))
-        if not transactions:
-            logger.info(f"No transactions found before {target_timestamp}. Checking for CreateStock within period {period_start} to {period_end}.")
-            tx_resp = transactions_table.scan(
-                FilterExpression=Attr('operation_type').eq('CreateStock') &
-                                 Attr('timestamp').between(period_start, period_end)
-            )
-            create_stock_txs = tx_resp.get('Items', [])
-            while 'LastEvaluatedKey' in tx_resp:
-                tx_resp = transactions_table.scan(
-                    FilterExpression=Attr('operation_type').eq('CreateStock') &
-                                     Attr('timestamp').between(period_start, period_end),
-                    ExclusiveStartKey=tx_resp['LastEvaluatedKey']
-                )
-                create_stock_txs.extend(tx_resp.get('Items', []))
-            if create_stock_txs:
-                earliest = min(create_stock_txs, key=lambda x: x.get('timestamp', ''))
-                details = earliest.get('details', {})
-                qty = Decimal(str(details.get('quantity', 0)))
-                defective = Decimal(str(details.get('defective', 0)))
-                available_qty = qty - defective
-                total_cost = Decimal(str(details.get('total_cost', 0)))
-                logger.info(f"Using earliest CreateStock in period: available_qty={available_qty}, total_cost={total_cost}")
-                return int(available_qty), float(total_cost)
-            else:
-                logger.info("No transactions or CreateStock found. Defaulting to 0.")
-                return 0, 0.0
-        transactions.sort(key=lambda x: x.get('timestamp', ''))
-        # Simulate the stock state from the transactions
-        item_states = {}
-        for tx in transactions:
-            op = tx.get('operation_type', '')
-            details = tx.get('details', {})
-            item_id = details.get('item_id', '')
-            if op == "CreateStock":
-                qty = Decimal(str(details.get("quantity", 0)))
-                defective = Decimal(str(details.get("defective", 0)))
-                total_cost = Decimal(str(details.get("total_cost", 0)))
-                available_qty = qty - defective
-                item_states[item_id] = {
-                    'available_qty': available_qty,
-                    'total_cost': total_cost,
-                    'cost_per_unit': Decimal(str(details.get('cost_per_unit', 0)))
-                }
-            elif item_id in item_states:
-                if op == "AddStockQuantity":
-                    add_qty = Decimal(str(details.get("quantity_added", 0)))
-                    add_cost = Decimal(str(details.get("added_cost", 0))) if "added_cost" in details else add_qty * item_states[item_id]['cost_per_unit']
-                    item_states[item_id]['available_qty'] += add_qty
-                    item_states[item_id]['total_cost'] += add_cost
-                elif op == "SubtractStockQuantity":
-                    sub_qty = Decimal(str(details.get("quantity_subtracted", 0)))
-                    cost = sub_qty * item_states[item_id]['cost_per_unit']
-                    item_states[item_id]['available_qty'] -= sub_qty
-                    item_states[item_id]['total_cost'] -= cost
-                elif op == "AddDefectiveGoods":
-                    def_added = Decimal(str(details.get("defective_added", 0)))
-                    item_states[item_id]['available_qty'] -= def_added
-                elif op == "SubtractDefectiveGoods":
-                    def_subtracted = Decimal(str(details.get("defective_subtracted", 0)))
-                    item_states[item_id]['available_qty'] += def_subtracted
-                elif op == "PushToProduction":
-                    if 'deductions' in details and item_id in details['deductions']:
-                        deduction = Decimal(str(details['deductions'][item_id]))
-                        cost = deduction * item_states[item_id]['cost_per_unit']
-                        item_states[item_id]['available_qty'] -= deduction
-                        item_states[item_id]['total_cost'] -= cost
-        total_available = sum(state['available_qty'] for state in item_states.values())
-        total_cost = sum(state['total_cost'] for state in item_states.values())
-        if total_available < 0:
-            total_available = Decimal('0')
-        if total_cost < 0:
-            total_cost = Decimal('0')
-        logger.info(f"Calculated opening stock at {target_timestamp}: qty={int(total_available)}, amount={float(total_cost)}")
-        return int(total_available), float(total_cost)
-    except Exception as e:
-        logger.error(f"Error in calculate_stock_at_timestamp: {str(e)}")
-        return 0, 0.0
+        # Use "report_date" from payload (YYYY-MM-DD); default to today (IST) if not provided.
+        report_date = body.get('report_date', (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")).strip()
+        logger.info(f"Daily report requested for report_date: {report_date}")
 
-def get_daily_report():
-    try:
-        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        today_midnight = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-        period_start = today_midnight.isoformat()
-        period_end = now_ist.isoformat()
-        opening_qty, opening_amount = calculate_stock_at_timestamp(period_start, period_start, period_end)
+        # Retrieve the saved opening and closing stock records for this date.
+        opening_record = get_existing_stock_record("SaveOpeningStock", report_date)
+        closing_record = get_existing_stock_record("SaveClosingStock", report_date)
+        if opening_record and closing_record:
+            opening_stock = opening_record.get('details', {})
+            closing_stock = closing_record.get('details', {})
+            opening_qty = opening_stock.get("opening_stock_qty", 0)
+            opening_amount = float(opening_stock.get("opening_stock_amount", 0))
+            closing_qty = closing_stock.get("closing_stock_qty", 0)
+            closing_amount = float(closing_stock.get("closing_stock_amount", 0))
+            if opening_qty > closing_qty:
+                consumption_qty = opening_qty - closing_qty
+                consumption_amount = opening_amount - closing_amount
+            else:
+                consumption_qty = 0
+                consumption_amount = 0
+            stock_summary = {
+                "opening_stock_qty": opening_qty,
+                "opening_stock_amount": opening_amount,
+                "closing_stock_qty": closing_qty,
+                "closing_stock_amount": closing_amount,
+                "consumption_qty": consumption_qty,
+                "consumption_amount": consumption_amount
+            }
+        else:
+            # Even if saved opening/closing records are missing, return transactions (stock_summary remains empty).
+            stock_summary = {}
+
+        # Retrieve all transactions for that day using an exact match on the "date" attribute.
         transactions_table = dynamodb.Table(transactions_table_name)
         tx_resp = transactions_table.scan(
-            FilterExpression=Attr('timestamp').between(period_start, period_end)
+            FilterExpression=Attr('date').eq(report_date)
         )
         transactions = tx_resp.get('Items', [])
         while 'LastEvaluatedKey' in tx_resp:
             tx_resp = transactions_table.scan(
-                FilterExpression=Attr('timestamp').between(period_start, period_end),
+                FilterExpression=Attr('date').eq(report_date),
                 ExclusiveStartKey=tx_resp['LastEvaluatedKey']
             )
             transactions.extend(tx_resp.get('Items', []))
+        logger.info(f"Found {len(transactions)} transactions for report_date {report_date}")
         transactions_by_operation = group_transactions_by_operation(transactions)
         for op_type in transactions_by_operation:
             transactions_by_operation[op_type].sort(key=lambda x: x.get('timestamp', ''))
             for tx in transactions_by_operation[op_type]:
                 tx['timestamp'] = format_ist_timestamp(tx['timestamp'])
-        (add_qty, add_amt, cons_qty, cons_amt) = classify_addition_and_consumption(transactions)
-        closing_qty, closing_amount = get_current_stock_summary()
-        # Instead of computing opening from final DB (which might be inconsistent), we use the calculated opening
-        # and force non-negative values.
-        if opening_qty < 0:
-            opening_qty = 0
-        if opening_amount < 0:
-            opening_amount = 0.0
-        stock_summary = {
-            "opening_stock_qty": opening_qty,
-            "opening_stock_amount": opening_amount,
-            "consumption_qty": float(cons_qty),
-            "consumption_amount": float(cons_amt),
-            "closing_stock_qty": closing_qty,
-            "closing_stock_amount": float(closing_amount)
-        }
+
         return {
             "statusCode": 200,
             "body": json.dumps({
+                "report_date": report_date,
                 "stock_summary": stock_summary,
                 "transactions_by_operation": transactions_by_operation
             }, cls=DecimalEncoder)
@@ -1427,127 +1377,452 @@ def get_daily_report():
         logger.error(f"Error in get_daily_report: {str(e)}")
         return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
 
-def get_weekly_report():
+
+def get_weekly_report(body):
     try:
-        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        seven_days_ago = now_ist - timedelta(days=7)
-        period_start = seven_days_ago.isoformat()
-        period_end = now_ist.isoformat()
-        opening_qty, opening_amount = calculate_stock_at_timestamp(period_start, period_start, period_end)
+        # Expect "start_date" and "end_date" in YYYY-MM-DD format.
+        start_date = body.get('start_date')
+        end_date = body.get('end_date')
+        if not start_date or not end_date:
+            now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            end_date = now.strftime("%Y-%m-%d")
+            start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        start_date = start_date.strip()
+        end_date = end_date.strip()
+        logger.info(f"Weekly report requested for period: {start_date} to {end_date}")
+
+        # Retrieve all transactions for the period based on the 'date' attribute.
         transactions_table = dynamodb.Table(transactions_table_name)
         tx_resp = transactions_table.scan(
-            FilterExpression=Attr('timestamp').between(period_start, period_end)
+            FilterExpression=Attr('date').between(start_date, end_date)
         )
         transactions = tx_resp.get('Items', [])
         while 'LastEvaluatedKey' in tx_resp:
             tx_resp = transactions_table.scan(
-                FilterExpression=Attr('timestamp').between(period_start, period_end),
+                FilterExpression=Attr('date').between(start_date, end_date),
                 ExclusiveStartKey=tx_resp['LastEvaluatedKey']
             )
             transactions.extend(tx_resp.get('Items', []))
-        transactions_by_operation = group_transactions_by_operation(transactions)
-        for op_type in transactions_by_operation:
-            transactions_by_operation[op_type].sort(key=lambda x: x.get('timestamp', ''))
-            for tx in transactions_by_operation[op_type]:
+        logger.info(f"Found {len(transactions)} transactions for the weekly period.")
+
+        # Group transactions by date.
+        daily_data = {}
+        for tx in transactions:
+            tx_date = tx.get('date')
+            if tx_date:
+                tx_date = tx_date.strip()
+                if start_date <= tx_date <= end_date:
+                    daily_data.setdefault(tx_date, []).append(tx)
+
+        # Sort dates in ascending order.
+        sorted_dates = sorted(daily_data.keys())
+        daily_report = {}
+        for tx_date in sorted_dates:
+            txs = daily_data[tx_date]
+            # Sort transactions within the day by timestamp.
+            txs.sort(key=lambda x: x.get('timestamp', ''))
+            for tx in txs:
                 tx['timestamp'] = format_ist_timestamp(tx['timestamp'])
-        (add_qty, add_amt, cons_qty, cons_amt) = classify_addition_and_consumption(transactions)
-        closing_qty, closing_amount = get_current_stock_summary()
-        if opening_qty < 0:
-            opening_qty = 0
-        if opening_amount < 0:
-            opening_amount = 0.0
-        stock_summary = {
-            "opening_stock_qty": opening_qty,
-            "opening_stock_amount": opening_amount,
-            "consumption_qty": float(cons_qty),
-            "consumption_amount": float(cons_amt),
-            "closing_stock_qty": closing_qty,
-            "closing_stock_amount": float(closing_amount)
-        }
+            # Retrieve saved opening and closing records for the day (if available).
+            opening_record = get_existing_stock_record("SaveOpeningStock", tx_date)
+            closing_record = get_existing_stock_record("SaveClosingStock", tx_date)
+            if opening_record and closing_record:
+                opening_stock = opening_record.get('details', {})
+                closing_stock = closing_record.get('details', {})
+                opening_qty = opening_stock.get("opening_stock_qty", 0)
+                opening_amount = float(opening_stock.get("opening_stock_amount", 0))
+                closing_qty = closing_stock.get("closing_stock_qty", 0)
+                closing_amount = float(closing_stock.get("closing_stock_amount", 0))
+                if opening_qty > closing_qty:
+                    consumption_qty = opening_qty - closing_qty
+                    consumption_amount = opening_amount - closing_amount
+                else:
+                    consumption_qty = 0
+                    consumption_amount = 0
+                stock_summary = {
+                    "opening_stock_qty": opening_qty,
+                    "opening_stock_amount": opening_amount,
+                    "closing_stock_qty": closing_qty,
+                    "closing_stock_amount": closing_amount,
+                    "consumption_qty": consumption_qty,
+                    "consumption_amount": consumption_amount
+                }
+            else:
+                stock_summary = {}
+            daily_report[tx_date] = {
+                "stock_summary": stock_summary,
+                "transactions": txs
+            }
+
+        # Compute overall weekly summary using the earliest and latest dates with saved records.
+        overall_summary = {}
+        # Consider only dates with both saved opening and closing stock records.
+        dates_with_records = [d for d in sorted_dates if get_existing_stock_record("SaveOpeningStock", d) and get_existing_stock_record("SaveClosingStock", d)]
+        if dates_with_records:
+            overall_opening_date = dates_with_records[0]
+            overall_closing_date = dates_with_records[-1]
+            overall_opening_record = get_existing_stock_record("SaveOpeningStock", overall_opening_date)
+            overall_closing_record = get_existing_stock_record("SaveClosingStock", overall_closing_date)
+            if overall_opening_record and overall_closing_record:
+                opening_stock = overall_opening_record.get('details', {})
+                closing_stock = overall_closing_record.get('details', {})
+                opening_qty = opening_stock.get("opening_stock_qty", 0)
+                opening_amount = float(opening_stock.get("opening_stock_amount", 0))
+                closing_qty = closing_stock.get("closing_stock_qty", 0)
+                closing_amount = float(closing_stock.get("closing_stock_amount", 0))
+                if opening_qty > closing_qty:
+                    consumption_qty = opening_qty - closing_qty
+                    consumption_amount = opening_amount - closing_amount
+                else:
+                    consumption_qty = 0
+                    consumption_amount = 0
+                overall_summary = {
+                    "opening_stock_qty": opening_qty,
+                    "opening_stock_amount": opening_amount,
+                    "closing_stock_qty": closing_qty,
+                    "closing_stock_amount": closing_amount,
+                    "consumption_qty": consumption_qty,
+                    "consumption_amount": consumption_amount
+                }
         return {
             "statusCode": 200,
             "body": json.dumps({
-                "stock_summary": stock_summary,
-                "transactions_by_operation": transactions_by_operation
+                "report_period": {"start_date": start_date, "end_date": end_date},
+                "overall_stock_summary": overall_summary,
+                "daily_report": daily_report
             }, cls=DecimalEncoder)
         }
     except Exception as e:
         logger.error(f"Error in get_weekly_report: {str(e)}")
         return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
 
-def get_monthly_report():
+
+def get_monthly_report(body):
     try:
+        if 'month' not in body:
+            return {"statusCode": 400, "body": json.dumps({"error": "'month' parameter is required in format YYYY-MM"})}
+        month_str = body['month'].strip()
+        try:
+            year, month = map(int, month_str.split('-'))
+        except Exception as e:
+            logger.error("Invalid month format")
+            return {"statusCode": 400, "body": json.dumps({"error": "'month' must be in format YYYY-MM"})}
         now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        first_of_month = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        period_start = first_of_month.isoformat()
-        period_end = now_ist.isoformat()
-        opening_qty, opening_amount = calculate_stock_at_timestamp(period_start, period_start, period_end)
+        if year > now_ist.year or (year == now_ist.year and month > now_ist.month):
+            logger.info("Requested month is in the future")
+            return {"statusCode": 200, "body": json.dumps({
+                "report_period": {"year": year, "month": month, "start_date": None, "end_date": None},
+                "report": {}
+            })}
+        first_day = date(year, month, 1)
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        start_date_str = first_day.strftime("%Y-%m-%d")
+        end_date_str = last_day.strftime("%Y-%m-%d")
+        logger.info(f"Monthly report requested for {month_str} (range: {start_date_str} to {end_date_str})")
+
         transactions_table = dynamodb.Table(transactions_table_name)
         tx_resp = transactions_table.scan(
-            FilterExpression=Attr('timestamp').between(period_start, period_end)
+            FilterExpression=Attr('date').between(start_date_str, end_date_str)
         )
         transactions = tx_resp.get('Items', [])
         while 'LastEvaluatedKey' in tx_resp:
             tx_resp = transactions_table.scan(
-                FilterExpression=Attr('timestamp').between(period_start, period_end),
+                FilterExpression=Attr('date').between(start_date_str, end_date_str),
                 ExclusiveStartKey=tx_resp['LastEvaluatedKey']
             )
             transactions.extend(tx_resp.get('Items', []))
-        transactions_by_operation = group_transactions_by_operation(transactions)
-        for op_type in transactions_by_operation:
-            transactions_by_operation[op_type].sort(key=lambda x: x.get('timestamp', ''))
-            for tx in transactions_by_operation[op_type]:
+        logger.info(f"Found {len(transactions)} transactions for the month.")
+        if not transactions:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "report_period": {"year": year, "month": month, "start_date": start_date_str, "end_date": end_date_str},
+                    "report": {}
+                })
+            }
+        # Group transactions by "date"
+        daily_data = {}
+        for tx in transactions:
+            tx_date = tx.get('date')
+            if tx_date:
+                tx_date = tx_date.strip()
+                daily_data.setdefault(tx_date, []).append(tx)
+        sorted_dates = sorted(daily_data.keys())
+        daily_report = {}
+        for tx_date in sorted_dates:
+            txs = daily_data[tx_date]
+            txs.sort(key=lambda x: x.get('timestamp', ''))
+            for tx in txs:
                 tx['timestamp'] = format_ist_timestamp(tx['timestamp'])
-        (add_qty, add_amt, cons_qty, cons_amt) = classify_addition_and_consumption(transactions)
-        closing_qty, closing_amount = get_current_stock_summary()
-        if opening_qty < 0:
-            opening_qty = 0
-        if opening_amount < 0:
-            opening_amount = 0.0
-        stock_summary = {
-            "opening_stock_qty": opening_qty,
-            "opening_stock_amount": opening_amount,
-            "consumption_qty": float(cons_qty),
-            "consumption_amount": float(cons_amt),
-            "closing_stock_qty": closing_qty,
-            "closing_stock_amount": float(closing_amount)
-        }
+            opening_record = get_existing_stock_record("SaveOpeningStock", tx_date)
+            closing_record = get_existing_stock_record("SaveClosingStock", tx_date)
+            if opening_record and closing_record:
+                opening_stock = opening_record.get('details', {})
+                closing_stock = closing_record.get('details', {})
+                opening_qty = opening_stock.get("opening_stock_qty", 0)
+                opening_amount = float(opening_stock.get("opening_stock_amount", 0))
+                closing_qty = closing_stock.get("closing_stock_qty", 0)
+                closing_amount = float(closing_stock.get("closing_stock_amount", 0))
+                if opening_qty > closing_qty:
+                    consumption_qty = opening_qty - closing_qty
+                    consumption_amount = opening_amount - closing_amount
+                else:
+                    consumption_qty = 0
+                    consumption_amount = 0
+                stock_summary = {
+                    "opening_stock_qty": opening_qty,
+                    "opening_stock_amount": opening_amount,
+                    "closing_stock_qty": closing_qty,
+                    "closing_stock_amount": closing_amount,
+                    "consumption_qty": consumption_qty,
+                    "consumption_amount": consumption_amount
+                }
+            else:
+                stock_summary = {}
+            daily_report[tx_date] = {
+                "stock_summary": stock_summary,
+                "transactions": txs
+            }
+
+        # Compute overall monthly summary: opening from the earliest day and closing from the latest day with saved records.
+        overall_summary = {}
+        dates_with_records = [d for d in sorted_dates if get_existing_stock_record("SaveOpeningStock", d) and get_existing_stock_record("SaveClosingStock", d)]
+        if dates_with_records:
+            overall_opening_date = dates_with_records[0]
+            overall_closing_date = dates_with_records[-1]
+            overall_opening_record = get_existing_stock_record("SaveOpeningStock", overall_opening_date)
+            overall_closing_record = get_existing_stock_record("SaveClosingStock", overall_closing_date)
+            if overall_opening_record and overall_closing_record:
+                opening_stock = overall_opening_record.get('details', {})
+                closing_stock = overall_closing_record.get('details', {})
+                opening_qty = opening_stock.get("opening_stock_qty", 0)
+                opening_amount = float(opening_stock.get("opening_stock_amount", 0))
+                closing_qty = closing_stock.get("closing_stock_qty", 0)
+                closing_amount = float(closing_stock.get("closing_stock_amount", 0))
+                if opening_qty > closing_qty:
+                    consumption_qty = opening_qty - closing_qty
+                    consumption_amount = opening_amount - closing_amount
+                else:
+                    consumption_qty = 0
+                    consumption_amount = 0
+                overall_summary = {
+                    "opening_stock_qty": opening_qty,
+                    "opening_stock_amount": opening_amount,
+                    "closing_stock_qty": closing_qty,
+                    "closing_stock_amount": closing_amount,
+                    "consumption_qty": consumption_qty,
+                    "consumption_amount": consumption_amount
+                }
         return {
             "statusCode": 200,
             "body": json.dumps({
-                "stock_summary": stock_summary,
-                "transactions_by_operation": transactions_by_operation
+                "report_period": {"year": year, "month": month, "start_date": start_date_str, "end_date": end_date_str},
+                "overall_stock_summary": overall_summary,
+                "daily_report": daily_report
             }, cls=DecimalEncoder)
         }
     except Exception as e:
         logger.error(f"Error in get_monthly_report: {str(e)}")
         return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
 
+
+# =============================================================================
+# NEW FUNCTIONS: SAVE OPENING AND CLOSING STOCK
+# =============================================================================
+
+def get_existing_stock_record(operation, report_date):
+    try:
+        report_date = report_date.strip()
+        transactions_table = dynamodb.Table(transactions_table_name)
+        # Use an exact equality on the "date" attribute.
+        resp = transactions_table.scan(
+            FilterExpression=Attr('operation_type').eq(operation) & Attr('date').eq(report_date)
+        )
+        items = resp.get('Items', [])
+        if items:
+            logger.info(f"Found {len(items)} record(s) for {operation} on {report_date}")
+            return min(items, key=lambda x: x.get('timestamp', ''))
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_existing_stock_record: {str(e)}")
+        return None
+
+def save_opening_stock(body):
+    try:
+        if 'username' not in body:
+            return {"statusCode": 400, "body": json.dumps({"error": "'username' is required"})}
+        username = body['username']
+        current_qty, current_amount = get_current_stock_summary()
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        timestamp_str = now_ist.isoformat()
+        report_date = now_ist.strftime("%Y-%m-%d").strip()
+        details = {
+            "opening_stock_qty": current_qty,
+            "opening_stock_amount": current_amount
+        }
+        transactions_table = dynamodb.Table(transactions_table_name)
+        existing = get_existing_stock_record("SaveOpeningStock", report_date)
+        if existing:
+            transactions_table.update_item(
+                Key={'transaction_id': existing['transaction_id']},
+                UpdateExpression="SET details = :d, #ts = :t, #dt = :r",
+                ExpressionAttributeNames={'#ts': 'timestamp', '#dt': 'date'},
+                ExpressionAttributeValues={
+                    ':d': details,
+                    ':t': timestamp_str,
+                    ':r': report_date
+                }
+            )
+            log_undo_action("SaveOpeningStock", details, username)
+            logger.info(f"Updated opening stock for {username} on {report_date}: qty={current_qty}, amount={current_amount}")
+            response_message = "Opening stock updated successfully."
+        else:
+            log_transaction("SaveOpeningStock", details, username)
+            log_undo_action("SaveOpeningStock", details, username)
+            logger.info(f"Saved opening stock for {username} on {report_date}: qty={current_qty}, amount={current_amount}")
+            response_message = "Opening stock saved successfully."
+        return {"statusCode": 200, "body": json.dumps({
+            "message": response_message,
+            "opening_stock_qty": current_qty,
+            "opening_stock_amount": current_amount,
+            "timestamp": timestamp_str
+        }, cls=DecimalEncoder)}
+    except Exception as e:
+        logger.error(f"Error in save_opening_stock: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
+
+def save_closing_stock(body):
+    try:
+        if 'username' not in body:
+            return {"statusCode": 400, "body": json.dumps({"error": "'username' is required"})}
+        username = body['username']
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        closing_timestamp = now_ist.isoformat()
+        closing_qty, closing_amount = get_current_stock_summary()  # closing_amount is Decimal
+        report_date = now_ist.strftime("%Y-%m-%d").strip()
+        transactions_table = dynamodb.Table(transactions_table_name)
+        opening_record = get_existing_stock_record("SaveOpeningStock", report_date)
+        if not opening_record:
+            return {"statusCode": 400, "body": json.dumps({"error": "Opening stock not saved for today. Cannot calculate consumption."})}
+        # Retrieve transactions between the saved opening stock timestamp and closing_timestamp
+        tx_resp = transactions_table.scan(
+            FilterExpression=Attr('timestamp').between(opening_record['timestamp'], closing_timestamp)
+        )
+        transactions = tx_resp.get('Items', [])
+        while 'LastEvaluatedKey' in tx_resp:
+            tx_resp = transactions_table.scan(
+                FilterExpression=Attr('timestamp').between(opening_record['timestamp'], closing_timestamp),
+                ExclusiveStartKey=tx_resp['LastEvaluatedKey']
+            )
+            transactions.extend(tx_resp.get('Items', []))
+        # Get opening stock details (as stored, should be Decimal)
+        opening_stock = get_existing_stock_record("SaveOpeningStock", report_date)
+        if opening_stock:
+            opening_qty = opening_stock.get('details', {}).get("opening_stock_qty", 0)
+            # Ensure opening_amount is a Decimal
+            opening_amount = opening_stock.get('details', {}).get("opening_stock_amount", Decimal('0'))
+        else:
+            opening_qty = 0
+            opening_amount = Decimal('0')
+        # Calculate consumption: if opening > closing then consumption = opening - closing; otherwise 0.
+        if opening_qty > closing_qty:
+            consumption_qty = opening_qty - closing_qty
+            consumption_amount = opening_amount - closing_amount
+        else:
+            consumption_qty = 0
+            consumption_amount = Decimal('0')
+        details = {
+            "closing_stock_qty": closing_qty,
+            "closing_stock_amount": closing_amount,
+            "consumption_qty": consumption_qty,
+            "consumption_amount": consumption_amount
+        }
+        existing = get_existing_stock_record("SaveClosingStock", report_date)
+        if existing:
+            transactions_table.update_item(
+                Key={'transaction_id': existing['transaction_id']},
+                UpdateExpression="SET details = :d, #ts = :t, #dt = :r",
+                ExpressionAttributeNames={'#ts': 'timestamp', '#dt': 'date'},
+                ExpressionAttributeValues={
+                    ':d': details,
+                    ':t': closing_timestamp,
+                    ':r': report_date
+                }
+            )
+            log_undo_action("SaveClosingStock", details, username)
+            logger.info(f"Updated closing stock for {username} on {report_date}: qty={closing_qty}, amount={closing_amount}, consumption_qty={consumption_qty}, consumption_amount={consumption_amount}")
+            response_message = "Closing stock updated successfully."
+        else:
+            log_transaction("SaveClosingStock", details, username)
+            log_undo_action("SaveClosingStock", details, username)
+            logger.info(f"Saved closing stock for {username} on {report_date}: qty={closing_qty}, amount={closing_amount}, consumption_qty={consumption_qty}, consumption_amount={consumption_amount}")
+            response_message = "Closing stock saved successfully."
+        return {"statusCode": 200, "body": json.dumps({
+            "message": response_message,
+            "closing_stock_qty": closing_qty,
+            "closing_stock_amount": float(closing_amount),
+            "consumption_qty": consumption_qty,
+            "consumption_amount": float(consumption_amount),
+            "timestamp": closing_timestamp
+        }, cls=DecimalEncoder)}
+    except Exception as e:
+        logger.error(f"Error in save_closing_stock: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
+
+def get_all_stock_transactions(body):
+    try:
+        transactions_table = dynamodb.Table(transactions_table_name)
+        items = []
+        response = transactions_table.scan()
+        items.extend(response.get('Items', []))
+        while 'LastEvaluatedKey' in response:
+            response = transactions_table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            items.extend(response.get('Items', []))
+        # Sort the items by timestamp (ascending order)
+        items.sort(key=lambda x: x.get('timestamp', ''))
+        logger.info(f"Retrieved {len(items)} stock transaction records.")
+        return {"statusCode": 200, "body": json.dumps(items, cls=DecimalEncoder)}
+    except Exception as e:
+        logger.error(f"Error in get_all_stock_transactions: {str(e)}")
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
+
 # =============================================================================
 # LAMBDA HANDLER
 # =============================================================================
 
-def lambda_handler(event, context):
+def add_cors_headers(response):
     cors_headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "OPTIONS, GET, POST, PUT, DELETE",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, access-control-allow-methods"
     }
+    if not response.get("headers"):
+        response["headers"] = {}
+    response["headers"].update(cors_headers)
+    return response
+
+def lambda_handler(event, context):
     try:
         http_method = event.get("httpMethod") or event.get("requestContext", {}).get("http", {}).get("method", "")
         if http_method.upper() == "OPTIONS":
-            return {"statusCode": 200, "headers": cors_headers, "body": ""}
+            return add_cors_headers({"statusCode": 200, "body": ""})
         initialize_tables()
         body = json.loads(event.get('body', '{}'))
         operation = body.get('operation')
         if not operation:
-            return {"statusCode": 400, "headers": cors_headers, "body": json.dumps({"error": "Missing 'operation' field"})}
+            return add_cors_headers({
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing 'operation' field"})
+            })
         if operation == "GetDailyReport":
-            response = get_daily_report()
+            response = get_daily_report(body)
         elif operation == "GetWeeklyReport":
-            response = get_weekly_report()
+            response = get_weekly_report(body)
+        elif operation == "GetAllStockTransactions":
+            response = get_all_stock_transactions(body)
+    
         elif operation == "GetMonthlyReport":
-            response = get_monthly_report()
+            response = get_monthly_report(body)
         elif operation == "CreateStock":
             response = create_stock(body)
         elif operation == "UpdateStock":
@@ -1590,24 +1865,23 @@ def lambda_handler(event, context):
             response = login_user(body)
         elif operation == "UndoAction":
             response = undo_action(body)
+        elif operation == "SaveOpeningStock":
+            response = save_opening_stock(body)
+        elif operation == "SaveClosingStock":
+            response = save_closing_stock(body)
+        elif operation == "GetAllPushToProduction":   
+            response = get_all_push_to_production(body)     
         else:
             response = {"statusCode": 400, "body": json.dumps({"error": "Invalid operation"})}
-        response["headers"] = cors_headers
-        return response
+        return add_cors_headers(response)
     except json.JSONDecodeError:
-        return {"statusCode": 400, "headers": cors_headers, "body": json.dumps({"error": "Invalid JSON format"})}
+        return add_cors_headers({
+            "statusCode": 400,
+            "body": json.dumps({"error": "Invalid JSON format"})
+        })
     except Exception as e:
         logger.error(f"Error in lambda_handler: {e}")
-        return {"statusCode": 500, "headers": cors_headers, "body": json.dumps({"error": f"Internal error: {str(e)}"})}
-
-
-
-
-
-
-
-
-
-
-
-
+        return add_cors_headers({
+            "statusCode": 500,
+            "body": json.dumps({"error": f"Internal error: {str(e)}"})
+        })
